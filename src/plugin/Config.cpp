@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <vector>
+#include <utility>
 
 namespace {
 constexpr glz::opts opts {
@@ -20,7 +21,8 @@ constexpr glz::opts opts {
     .indentation_width = 4,
     .new_lines_in_arrays = true,
     .append_arrays = false,
-    .error_on_missing_keys = true,
+    // New options must not make existing configuration files invalid.
+    .error_on_missing_keys = false,
     .error_on_const_read = true,
     .bools_as_numbers = false,
     .quoted_num = false,
@@ -83,6 +85,15 @@ struct glz::meta<z3lx::plugin::Config> {
         "FOV smoothing must be between 0.0 and 1.0"
     >;
 
+    static constexpr auto burstFovDelayConstraintCondition = [](
+        const T&, const int delayMs) -> bool {
+        return delayMs >= 0 && delayMs <= 10000;
+    };
+    static constexpr auto burstFovDelayConstraint = read_constraint<
+        &T::burstFovDelayMs, burstFovDelayConstraintCondition,
+        "Burst FOV delay must be between 0 and 10000 milliseconds"
+    >;
+
     static constexpr auto value = object(
         &T::unlockFps,
         "targetFps", fpsOverrideConstraint,
@@ -93,7 +104,9 @@ struct glz::meta<z3lx::plugin::Config> {
         "fovSmoothing", fovSmoothingConstraint,
         &T::unlockFovKey,
         &T::nextFovPresetKey,
-        &T::prevFovPresetKey
+        &T::prevFovPresetKey,
+        &T::fixBurstFov,
+        "burstFovDelayMs", burstFovDelayConstraint
     );
 };
 
@@ -284,6 +297,10 @@ void Config::Serialize(std::vector<uint8_t>& buffer) {
 }
 
 void Config::Deserialize(const std::vector<uint8_t>& buffer) {
-    glz::ex::read<opts>(*this, buffer);
+    // Missing fields use defaults, including on reload. Do not apply a
+    // partially parsed configuration when validation fails.
+    Config next {};
+    glz::ex::read<opts>(next, buffer);
+    *this = std::move(next);
 }
 } // namespace z3lx::plugin

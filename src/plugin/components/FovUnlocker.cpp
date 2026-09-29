@@ -4,11 +4,14 @@
 
 #include <wil/result.h>
 
+#include <algorithm>
+#include <chrono>
 #include <bit>
 #include <cmath>
 #include <cstdint>
 #include <mutex>
 
+#include <intrin.h>
 #include <Windows.h>
 
 import mmh;
@@ -32,6 +35,58 @@ int setFovCount = 0;
 void* previousInstance = nullptr;
 float previousFov = 45.0f;
 bool isPreviousFov = false;
+
+// Optional heuristic for burst framing. Observe only the existing hook:
+// learn two alternating callers on one camera, then preserve native FOV
+// when a caller repeats. This is not an internal burst/animation-state flag.
+// Return when the partner reappears or the configured delay expires.
+using BurstClock = std::chrono::steady_clock;
+bool fixBurstFov = false;
+std::chrono::milliseconds burstNativeLimit { 1600 };
+std::chrono::milliseconds activeBurstNativeLimit { 1600 };
+constexpr float BURST_RETURN_SECONDS = 0.200f;
+constexpr unsigned int ALTERNATIONS_TO_ARM = 8;
+
+void* detectorInstance = nullptr;
+uintptr_t callerA = 0;
+uintptr_t callerB = 0;
+uintptr_t lastCaller = 0;
+uintptr_t burstCaller = 0;
+unsigned int alternatingTransitions = 0;
+bool detectorArmed = false;
+// Remains true through the early return until the partner has returned.
+// Otherwise the still-repeating caller could re-trigger native FOV.
+bool isBurstFovBypass = false;
+bool burstReturnStarted = false;
+bool burstPartnerReturned = false;
+BurstClock::time_point burstStart {};
+BurstClock::time_point burstReturnStart {};
+float burstReturnFrom = 45.0f;
+
+void ResetBurstDetector(
+    void* instance = nullptr, const uintptr_t caller = 0) noexcept {
+    detectorInstance = instance;
+    callerA = caller;
+    callerB = 0;
+    lastCaller = caller;
+    burstCaller = 0;
+    alternatingTransitions = 0;
+    detectorArmed = false;
+    isBurstFovBypass = false;
+    burstReturnStarted = false;
+    burstPartnerReturned = false;
+}
+
+void TrackBurstFov(
+    void* instance, const float nativeFov, const float outputFov) noexcept {
+    // Keep upstream restoration in sync with what we just sent. Its normal
+    // time constant and hook-disable logic are not changed by the burst ramp.
+    previousInstance = instance;
+    previousFov = nativeFov;
+    setFovCount = 0;
+    isPreviousFov = false;
+    filter.SetInitialValue(outputFov);
+}
 } // namespace
 
 namespace z3lx::plugin {
@@ -106,6 +161,15 @@ float FovUnlocker::GetSmoothing() const noexcept {
     return filter.GetTimeConstant();
 }
 
+void FovUnlocker::ConfigureBurstFov(const bool enable, const int delayMs) {
+    std::lock_guard lock { mutex };
+    fixBurstFov = enable;
+    burstNativeLimit = std::chrono::milliseconds { std::clamp(delayMs, 0, 10000) };
+    if (!enable) {
+        ResetBurstDetector();
+    }
+}
+
 void FovUnlocker::SetSmoothing(const float smoothing) noexcept {
     filter.SetTimeConstant(smoothing);
 }
@@ -114,8 +178,84 @@ void FovUnlocker::SetSmoothing(const float smoothing) noexcept {
 namespace {
 void HkSetFieldOfView(void* instance, float value) noexcept try {
     std::lock_guard lock { mutex };
+    const uintptr_t caller = fixBurstFov ?
+        reinterpret_cast<uintptr_t>(_ReturnAddress()) : 0;
     if (!hook.IsCreated()) {
         return;
+    }
+
+
+    // Original cursor/focus/toggle lifecycle always takes priority. Never
+    // keep an early-return override running in a menu or after re-enabling.
+    if (!isHooked || !isEnabled || isEnabledOnce || caller == 0) {
+        ResetBurstDetector();
+    } else if (instance != detectorInstance) {
+        ResetBurstDetector(instance, caller);
+    } else if (isBurstFovBypass) {
+        if (caller != callerA && caller != callerB) {
+            // Unexpected path: stop this experiment and use upstream handling.
+            ResetBurstDetector(instance, caller);
+        } else {
+            const auto now = BurstClock::now();
+            if (caller != burstCaller) {
+                burstPartnerReturned = true;
+            }
+            if (!burstReturnStarted &&
+                (burstPartnerReturned || now - burstStart >= activeBurstNativeLimit)) {
+                burstReturnStarted = true;
+                burstReturnStart = now;
+                burstReturnFrom = value;
+            }
+
+            const float nativeFov = value;
+            bool returnFinished = false;
+            if (burstReturnStarted) {
+                const float elapsed = std::chrono::duration<float>(
+                    now - burstReturnStart).count();
+                const float t = std::clamp(
+                    elapsed / BURST_RETURN_SECONDS, 0.0f, 1.0f);
+                const float blend = t * t * (3.0f - 2.0f * t);
+                const float target = static_cast<float>(targetFov);
+                value = (t >= 1.0f) ? target :
+                    burstReturnFrom + (target - burstReturnFrom) * blend;
+                returnFinished = t >= 1.0f;
+            }
+            TrackBurstFov(instance, nativeFov, value);
+            if (returnFinished && burstPartnerReturned) {
+                ResetBurstDetector(instance, caller);
+            }
+            hook.CallOriginal(instance, value);
+            return;
+        }
+    } else if (lastCaller == 0) {
+        ResetBurstDetector(instance, caller);
+    } else if (caller != lastCaller) {
+        if (callerB == 0) {
+            callerB = caller;
+        }
+        if (caller != callerA && caller != callerB) {
+            ResetBurstDetector(instance, caller);
+        } else {
+            lastCaller = caller;
+            if (alternatingTransitions < ALTERNATIONS_TO_ARM) {
+                ++alternatingTransitions;
+            }
+            detectorArmed = alternatingTransitions >= ALTERNATIONS_TO_ARM;
+        }
+    } else if (detectorArmed) {
+        isBurstFovBypass = true;
+        burstCaller = caller;
+        detectorArmed = false;
+        alternatingTransitions = 0;
+        activeBurstNativeLimit = burstNativeLimit;
+        burstStart = BurstClock::now();
+        burstReturnStarted = false;
+        burstPartnerReturned = false;
+        TrackBurstFov(instance, value, value);
+        hook.CallOriginal(instance, value);
+        return;
+    } else {
+        alternatingTransitions = 0;
     }
 
     ++setFovCount;

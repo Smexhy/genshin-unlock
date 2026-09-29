@@ -5,6 +5,7 @@
 
 #include <wil/result.h>
 
+#include <algorithm>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -257,8 +258,7 @@ void HkSetFieldOfView(void* instance, float value) noexcept try {
     if (isBurstFovBypass) {
         if (Clock::now() < burstFovBypassUntil) {
             TraceFov(instance, inputValue, value, "BYPASS", returnAddress);
-            TraceFov(instance, inputValue, value, "NORMAL", returnAddress);
-    hook.CallOriginal(instance, value);
+            hook.CallOriginal(instance, value);
             return;
         }
 
@@ -306,6 +306,7 @@ void HkSetFieldOfView(void* instance, float value) noexcept try {
         previousFov = value;
     }
 
+    TraceFov(instance, inputValue, value, "NORMAL", returnAddress);
     hook.CallOriginal(instance, value);
 } catch (...) {
     // Should never happen

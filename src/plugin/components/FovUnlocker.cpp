@@ -36,10 +36,9 @@ void* previousInstance = nullptr;
 float previousFov = 45.0f;
 bool isPreviousFov = false;
 
-// Optional heuristic for burst framing. Observe only the existing hook:
-// learn two alternating callers on one camera, then preserve native FOV
-// when a caller repeats. This is not an internal burst/animation-state flag.
-// Return when the partner reappears or the configured delay expires.
+// Burst heuristic: two FOV call sites alternate on the same camera.
+// If only one keeps calling, preserve native FOV until the other returns
+// or the configured delay expires.
 using BurstClock = std::chrono::steady_clock;
 bool fixBurstFov = false;
 std::chrono::milliseconds burstNativeLimit { 1600 };
@@ -54,11 +53,11 @@ uintptr_t lastCaller = 0;
 uintptr_t burstCaller = 0;
 unsigned int alternatingTransitions = 0;
 bool detectorArmed = false;
-// Remains true through the early return until the partner has returned.
-// Otherwise the still-repeating caller could re-trigger native FOV.
+// Keep this set until the other caller returns, even after the timed blend.
+// This prevents the repeated caller from starting the same bypass again.
 bool isBurstFovBypass = false;
 bool burstReturnStarted = false;
-bool burstPartnerReturned = false;
+bool otherCallerReturned = false;
 BurstClock::time_point burstStart {};
 BurstClock::time_point burstReturnStart {};
 float burstReturnFrom = 45.0f;
@@ -74,13 +73,12 @@ void ResetBurstDetector(
     detectorArmed = false;
     isBurstFovBypass = false;
     burstReturnStarted = false;
-    burstPartnerReturned = false;
+    otherCallerReturned = false;
 }
 
 void TrackBurstFov(
     void* instance, const float nativeFov, const float outputFov) noexcept {
-    // Keep upstream restoration in sync with what we just sent. Its normal
-    // time constant and hook-disable logic are not changed by the burst ramp.
+    // Seed normal smoothing with the last output to avoid a jump on menu entry.
     previousInstance = instance;
     previousFov = nativeFov;
     setFovCount = 0;
@@ -184,24 +182,22 @@ void HkSetFieldOfView(void* instance, float value) noexcept try {
         return;
     }
 
-
-    // Original cursor/focus/toggle lifecycle always takes priority. Never
-    // keep an early-return override running in a menu or after re-enabling.
+    // Leave menu, focus and toggle transitions to the original FOV handling.
     if (!isHooked || !isEnabled || isEnabledOnce || caller == 0) {
         ResetBurstDetector();
     } else if (instance != detectorInstance) {
         ResetBurstDetector(instance, caller);
     } else if (isBurstFovBypass) {
         if (caller != callerA && caller != callerB) {
-            // Unexpected path: stop this experiment and use upstream handling.
+            // Unknown FOV caller; fall back to normal handling.
             ResetBurstDetector(instance, caller);
         } else {
             const auto now = BurstClock::now();
             if (caller != burstCaller) {
-                burstPartnerReturned = true;
+                otherCallerReturned = true;
             }
             if (!burstReturnStarted &&
-                (burstPartnerReturned || now - burstStart >= activeBurstNativeLimit)) {
+                (otherCallerReturned || now - burstStart >= activeBurstNativeLimit)) {
                 burstReturnStarted = true;
                 burstReturnStart = now;
                 burstReturnFrom = value;
@@ -221,7 +217,7 @@ void HkSetFieldOfView(void* instance, float value) noexcept try {
                 returnFinished = t >= 1.0f;
             }
             TrackBurstFov(instance, nativeFov, value);
-            if (returnFinished && burstPartnerReturned) {
+            if (returnFinished && otherCallerReturned) {
                 ResetBurstDetector(instance, caller);
             }
             hook.CallOriginal(instance, value);
@@ -250,7 +246,7 @@ void HkSetFieldOfView(void* instance, float value) noexcept try {
         activeBurstNativeLimit = burstNativeLimit;
         burstStart = BurstClock::now();
         burstReturnStarted = false;
-        burstPartnerReturned = false;
+        otherCallerReturned = false;
         TrackBurstFov(instance, value, value);
         hook.CallOriginal(instance, value);
         return;

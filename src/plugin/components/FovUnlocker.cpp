@@ -36,12 +36,14 @@ void* previousInstance = nullptr;
 float previousFov = 45.0f;
 bool isPreviousFov = false;
 
-// Experimental fixed-timing alternative. Reuse the existing caller-pair
-// detector for START only; no HUD, stack walking, character lookup or logging.
-// A 1600 ms cap starts the return about 400 ms before the observed ~2 s
-// Vesna handover. This is a prediction, NOT a universal burst-end signal.
+// Optional heuristic for burst framing. Observe only the existing hook:
+// learn two alternating callers on one camera, then preserve native FOV
+// when a caller repeats. This is not an internal burst/animation-state flag.
+// Return when the partner reappears or the configured delay expires.
 using BurstClock = std::chrono::steady_clock;
-constexpr auto BURST_NATIVE_LIMIT = std::chrono::milliseconds { 1600 };
+bool fixBurstFov = false;
+std::chrono::milliseconds burstNativeLimit { 1700 };
+std::chrono::milliseconds activeBurstNativeLimit { 1700 };
 constexpr float BURST_RETURN_SECONDS = 0.200f;
 constexpr unsigned int ALTERNATIONS_TO_ARM = 8;
 
@@ -159,6 +161,15 @@ float FovUnlocker::GetSmoothing() const noexcept {
     return filter.GetTimeConstant();
 }
 
+void FovUnlocker::ConfigureBurstFov(const bool enable, const int delayMs) {
+    std::lock_guard lock { mutex };
+    fixBurstFov = enable;
+    burstNativeLimit = std::chrono::milliseconds { std::clamp(delayMs, 0, 10000) };
+    if (!enable) {
+        ResetBurstDetector();
+    }
+}
+
 void FovUnlocker::SetSmoothing(const float smoothing) noexcept {
     filter.SetTimeConstant(smoothing);
 }
@@ -166,8 +177,9 @@ void FovUnlocker::SetSmoothing(const float smoothing) noexcept {
 
 namespace {
 void HkSetFieldOfView(void* instance, float value) noexcept try {
-    const uintptr_t caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
     std::lock_guard lock { mutex };
+    const uintptr_t caller = fixBurstFov ?
+        reinterpret_cast<uintptr_t>(_ReturnAddress()) : 0;
     if (!hook.IsCreated()) {
         return;
     }
@@ -189,7 +201,7 @@ void HkSetFieldOfView(void* instance, float value) noexcept try {
                 burstPartnerReturned = true;
             }
             if (!burstReturnStarted &&
-                (burstPartnerReturned || now - burstStart >= BURST_NATIVE_LIMIT)) {
+                (burstPartnerReturned || now - burstStart >= activeBurstNativeLimit)) {
                 burstReturnStarted = true;
                 burstReturnStart = now;
                 burstReturnFrom = value;
@@ -235,6 +247,7 @@ void HkSetFieldOfView(void* instance, float value) noexcept try {
         burstCaller = caller;
         detectorArmed = false;
         alternatingTransitions = 0;
+        activeBurstNativeLimit = burstNativeLimit;
         burstStart = BurstClock::now();
         burstReturnStarted = false;
         burstPartnerReturned = false;

@@ -35,6 +35,10 @@ void Plugin::Update() {
     fpsUnlocker.AutoThrottle(configFile.Get<&C::autoThrottle>());
 
     // Update FOV unlocker
+    fovUnlocker.ConfigureBurstFov(
+        configFile.Get<&C::fixBurstFov>(),
+        configFile.Get<&C::burstFovDelayMs>()
+    );
     if (!fovUnlocker.IsHooked()) {
         return;
     }

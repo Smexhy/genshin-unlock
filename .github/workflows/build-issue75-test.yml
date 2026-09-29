@@ -18,6 +18,15 @@ jobs:
       - name: Build plugin
         shell: pwsh
         run: cmake --build build --config Release --target plugin
+      - name: Configure config tests
+        shell: pwsh
+        run: cmake -S tests/issue75 -B build-tests -G "Visual Studio 17 2022" -A x64 -DGLAZE_SOURCE_DIR="${{ github.workspace }}/build/_deps/glaze-src"
+      - name: Build config tests
+        shell: pwsh
+        run: cmake --build build-tests --config Release
+      - name: Test config compatibility and validation
+        shell: pwsh
+        run: ./build-tests/Release/config-tests.exe
       - name: Upload plugin.dll
         uses: actions/upload-artifact@v4
         with:

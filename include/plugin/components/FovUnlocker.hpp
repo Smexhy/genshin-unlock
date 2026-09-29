@@ -26,6 +26,9 @@ public:
     [[nodiscard]] int GetTargetFov() const noexcept;
     void SetTargetFov(int targetFov) noexcept;
 
+    // Delay changes apply to the next detected burst.
+    void ConfigureBurstFov(bool enable, int delayMs);
+
     [[nodiscard]] float GetSmoothing() const noexcept;
     void SetSmoothing(float smoothing) noexcept;
 };

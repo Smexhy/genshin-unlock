@@ -8,8 +8,8 @@
 #include <cmath>
 #include <cstdint>
 #include <mutex>
-#include <intrin.h>
 
+#include <intrin.h>
 #include <Windows.h>
 
 import mmh;
@@ -34,51 +34,40 @@ void* previousInstance = nullptr;
 float previousFov = 45.0f;
 bool isPreviousFov = false;
 
-// Burst/cinematic detector.
-//
-// In normal gameplay, the FOV setter is called from two call sites that
-// alternate every frame (A, B, A, B...). During the affected burst
-// cinematic, the secondary call disappears and the remaining call site
-// repeats (A, A, A...). When B returns, normal gameplay has resumed.
-//
-// Learn the pattern dynamically instead of hard-coding caller addresses so
-// the detector is not tied to the RVAs observed in a single game build.
-uintptr_t gameModuleBase = 0;
-uintptr_t lastCallerRva = 0;
-uintptr_t burstCallerRva = 0;
-uintptr_t burstExitLastCallerRva = 0;
+// Experimental camera-call heuristic, not an internal burst-state signal.
+// Observe only the existing FOV hook. No keys, timers or new game hooks.
+// Learn a specific pair on a single camera; a third caller or camera change
+// discards the old pattern rather than treating arbitrary changes as A/B.
+void* detectorInstance = nullptr;
+uintptr_t callerA = 0;
+uintptr_t callerB = 0;
+uintptr_t lastCaller = 0;
+uintptr_t burstCaller = 0;
 unsigned int alternatingTransitions = 0;
-unsigned int burstExitTransitions = 0;
 bool detectorArmed = false;
 bool isBurstFovBypass = false;
-
 constexpr unsigned int ALTERNATIONS_TO_ARM = 8;
-constexpr unsigned int ALTERNATIONS_TO_CONFIRM_BURST_EXIT = 4;
 
-uintptr_t GetCallerRva(void* returnAddress) noexcept {
-    const auto caller = reinterpret_cast<uintptr_t>(returnAddress);
-    return (caller >= gameModuleBase) ? (caller - gameModuleBase) : caller;
+void ResetBurstDetector(
+    void* instance = nullptr, const uintptr_t caller = 0) noexcept {
+    detectorInstance = instance;
+    callerA = caller;
+    callerB = 0;
+    lastCaller = caller;
+    burstCaller = 0;
+    alternatingTransitions = 0;
+    detectorArmed = false;
+    isBurstFovBypass = false;
 }
 
-void ResetFovStateForGameplay(void* instance, float gameFov) noexcept {
+void ResumeUpstreamFov(void* instance, const float gameFov) noexcept {
     previousInstance = instance;
     previousFov = gameFov;
     setFovCount = 0;
     isPreviousFov = false;
-
-    // Resume from the game's current FOV and let the existing configured
-    // smoothing handle the return to the user's gameplay FOV.
+    // Do not force the target FOV or alter the configured time constant.
+    // The upstream filter below resumes from the current native value.
     filter.SetInitialValue(gameFov);
-}
-
-void ResetBurstDetector(const uintptr_t callerRva = 0) noexcept {
-    lastCallerRva = callerRva;
-    burstCallerRva = 0;
-    burstExitLastCallerRva = 0;
-    alternatingTransitions = 0;
-    burstExitTransitions = 0;
-    detectorArmed = false;
-    isBurstFovBypass = false;
 }
 } // namespace
 
@@ -99,10 +88,12 @@ void FovUnlocker::Start() {
         default: THROW_WIN32(ERROR_NOT_SUPPORTED);
         }
     }();
-
-    gameModuleBase = reinterpret_cast<uintptr_t>(module);
-    const auto target = reinterpret_cast<void*>(gameModuleBase + offset);
-    const auto detour = reinterpret_cast<void*>(HkSetFieldOfView);
+    const auto target = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(module) + offset
+    );
+    const auto detour = reinterpret_cast<void*>(
+        HkSetFieldOfView
+    );
 
     std::lock_guard lock { mutex };
     hook = mmh::Hook<void, void*, float>::Create(target, detour);
@@ -159,84 +150,65 @@ void FovUnlocker::SetSmoothing(const float smoothing) noexcept {
 
 namespace {
 void HkSetFieldOfView(void* instance, float value) noexcept try {
-    void* const returnAddress = _ReturnAddress();
-    const uintptr_t callerRva = GetCallerRva(returnAddress);
-
+    const uintptr_t caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
     std::lock_guard lock { mutex };
     if (!hook.IsCreated()) {
         return;
     }
 
-    // Cursor/menu/dialog transitions intentionally disable the FOV hook at the
-    // component level. Do not let the cinematic detector interfere with the
-    // original smoothing behavior in those states.
-    if (!isHooked || !isEnabled) {
-        ResetBurstDetector(callerRva);
+
+    // Upstream lifecycle takes priority. Inactive/re-enabled states must
+    // reach the original smoothing and eventual hook-disable path below;
+    // the cinematic pass-through must never short-circuit that path.
+    if (!isHooked || !isEnabled || isEnabledOnce || caller == 0) {
+        ResetBurstDetector();
+    } else if (instance != detectorInstance) {
+        ResetBurstDetector(instance, caller);
     } else if (isBurstFovBypass) {
-        // Stay on native FOV until the normal alternating caller sequence has
-        // genuinely returned. One different caller can arrive slightly before
-        // the cinematic is visually finished, so require several alternating
-        // transitions rather than ending the bypass on the first one.
-        if (burstExitTransitions == 0) {
-            if (callerRva == burstCallerRva) {
-                hook.CallOriginal(instance, value);
-                return;
-            }
-
-            burstExitLastCallerRva = callerRva;
-            burstExitTransitions = 1;
+        if (caller == burstCaller) {
             hook.CallOriginal(instance, value);
             return;
         }
 
-        if (callerRva != burstExitLastCallerRva) {
-            burstExitLastCallerRva = callerRva;
-            ++burstExitTransitions;
-        } else {
-            // The candidate normal sequence broke again. Treat it as still
-            // cinematic and wait for a fresh alternating sequence.
-            burstExitTransitions = 0;
-            burstExitLastCallerRva = 0;
-            hook.CallOriginal(instance, value);
-            return;
-        }
-
-        if (burstExitTransitions < ALTERNATIONS_TO_CONFIRM_BURST_EXIT) {
-            hook.CallOriginal(instance, value);
-            return;
-        }
-
-        isBurstFovBypass = false;
-        burstCallerRva = 0;
-        burstExitLastCallerRva = 0;
-        burstExitTransitions = 0;
-        alternatingTransitions = 1;
-        lastCallerRva = callerRva;
-        ResetFovStateForGameplay(instance, value);
-    } else if (lastCallerRva == 0) {
-        lastCallerRva = callerRva;
-    } else if (callerRva != lastCallerRva) {
-        lastCallerRva = callerRva;
-        if (alternatingTransitions < ALTERNATIONS_TO_ARM) {
-            ++alternatingTransitions;
-        }
-        if (alternatingTransitions >= ALTERNATIONS_TO_ARM) {
-            detectorArmed = true;
-        }
-    } else {
-        // Two consecutive calls from the same site means the normal A/B
-        // alternation has broken. In the captured Vesna trace this occurs
-        // during the burst cinematic.
-        if (detectorArmed) {
-            isBurstFovBypass = true;
-            burstCallerRva = callerRva;
-            burstExitLastCallerRva = 0;
-            burstExitTransitions = 0;
+        // Stop bypassing on this first changed caller. In particular, the
+        // learned partner resumes upstream handling on the SAME call,
+        // without an extra exit-confirmation counter or a timed hold.
+        // An unknown caller also abandons the heuristic, but is not proof
+        // that the burst has visually ended.
+        const bool isKnownCaller = caller == callerA || caller == callerB;
+        if (isKnownCaller) {
+            isBurstFovBypass = false;
+            burstCaller = 0;
+            lastCaller = caller;
             alternatingTransitions = 0;
-            hook.CallOriginal(instance, value);
-            return;
+            detectorArmed = false;
+        } else {
+            ResetBurstDetector(instance, caller);
         }
-
+        ResumeUpstreamFov(instance, value);
+    } else if (lastCaller == 0) {
+        ResetBurstDetector(instance, caller);
+    } else if (caller != lastCaller) {
+        if (callerB == 0) {
+            callerB = caller;
+        }
+        if (caller != callerA && caller != callerB) {
+            ResetBurstDetector(instance, caller);
+        } else {
+            lastCaller = caller;
+            if (alternatingTransitions < ALTERNATIONS_TO_ARM) {
+                ++alternatingTransitions;
+            }
+            detectorArmed = alternatingTransitions >= ALTERNATIONS_TO_ARM;
+        }
+    } else if (detectorArmed) {
+        isBurstFovBypass = true;
+        burstCaller = caller;
+        detectorArmed = false;
+        alternatingTransitions = 0;
+        hook.CallOriginal(instance, value);
+        return;
+    } else {
         alternatingTransitions = 0;
     }
 

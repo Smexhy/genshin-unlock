@@ -5,6 +5,7 @@
 #include <wil/result.h>
 
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <mutex>
@@ -32,6 +33,12 @@ int setFovCount = 0;
 void* previousInstance = nullptr;
 float previousFov = 45.0f;
 bool isPreviousFov = false;
+
+using Clock = std::chrono::steady_clock;
+constexpr auto BURST_FOV_BYPASS_DURATION = std::chrono::seconds { 4 };
+bool wasBurstKeyDown = false;
+bool isBurstFovBypass = false;
+Clock::time_point burstFovBypassUntil {};
 } // namespace
 
 namespace z3lx::plugin {
@@ -65,7 +72,20 @@ void FovUnlocker::Start() {
 void FovUnlocker::Update() {
     const auto& cursor = GetComponent<CursorState>();
     const auto& window = GetComponent<WindowState>();
-    Hook(window.IsFocused() && !cursor.IsVisible());
+    const bool shouldHook = window.IsFocused() && !cursor.IsVisible();
+    Hook(shouldHook);
+
+    // Diagnostic workaround for issue #75: temporarily let the game own FOV
+    // while a burst cinematic is expected to be active.
+    const bool burstKeyDown =
+        shouldHook && ((GetAsyncKeyState('Q') & 0x8000) != 0);
+
+    std::lock_guard lock { mutex };
+    if (burstKeyDown && !wasBurstKeyDown && isEnabled) {
+        isBurstFovBypass = true;
+        burstFovBypassUntil = Clock::now() + BURST_FOV_BYPASS_DURATION;
+    }
+    wasBurstKeyDown = burstKeyDown;
 }
 
 bool FovUnlocker::IsHooked() const noexcept {
@@ -116,6 +136,20 @@ void HkSetFieldOfView(void* instance, float value) noexcept try {
     std::lock_guard lock { mutex };
     if (!hook.IsCreated()) {
         return;
+    }
+
+    if (isBurstFovBypass) {
+        if (Clock::now() < burstFovBypassUntil) {
+            hook.CallOriginal(instance, value);
+            return;
+        }
+
+        isBurstFovBypass = false;
+        previousInstance = instance;
+        previousFov = value;
+        setFovCount = 0;
+        isPreviousFov = false;
+        filter.SetInitialValue(value);
     }
 
     ++setFovCount;

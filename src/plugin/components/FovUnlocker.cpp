@@ -38,10 +38,10 @@ bool isPreviousFov = false;
 
 // Experimental fixed-timing alternative. Reuse the existing caller-pair
 // detector for START only; no HUD, stack walking, character lookup or logging.
-// A 1500 ms cap starts the return about 500 ms before the observed ~2 s
+// A 1600 ms cap starts the return about 400 ms before the observed ~2 s
 // Vesna handover. This is a prediction, NOT a universal burst-end signal.
 using BurstClock = std::chrono::steady_clock;
-constexpr auto BURST_NATIVE_LIMIT = std::chrono::milliseconds { 1500 };
+constexpr auto BURST_NATIVE_LIMIT = std::chrono::milliseconds { 1600 };
 constexpr float BURST_RETURN_SECONDS = 0.200f;
 constexpr unsigned int ALTERNATIONS_TO_ARM = 8;
 

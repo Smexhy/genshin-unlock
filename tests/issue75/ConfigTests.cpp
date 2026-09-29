@@ -22,12 +22,12 @@ std::string Write(Config& c) {
 }
 int main() try {
     Config c;
-    Check(!c.fixBurstFov && c.burstFovDelayMs == 1700, "opt-in / 1700ms defaults");
+    Check(!c.fixBurstFov && c.burstFovDelayMs == 1600, "opt-in / 1600ms defaults");
     Read(c, R"({"unlockFps":true,"targetFps":240,"autoThrottle":true,
         "unlockFov":true,"targetFov":110,"fovPresets":[45,90,110],
         "fovSmoothing":0.125,"unlockFovKey":"DownArrow",
         "nextFovPresetKey":"RightArrow","prevFovPresetKey":"LeftArrow"})");
-    Check(c.targetFps==240 && c.targetFov==110 && !c.fixBurstFov && c.burstFovDelayMs==1700,
+    Check(c.targetFps==240 && c.targetFov==110 && !c.fixBurstFov && c.burstFovDelayMs==1600,
           "legacy config keeps supplied settings and defaults new fields");
     Read(c, R"({"fixBurstFov":true,"burstFovDelayMs":1800,"targetFov":90})");
     Check(c.fixBurstFov && c.burstFovDelayMs==1800, "new fields load");
@@ -38,8 +38,8 @@ int main() try {
     for(const char* invalid : {
         R"({"fixBurstFov":false,"burstFovDelayMs":-1})",
         R"({"fixBurstFov":false,"burstFovDelayMs":10001})",
-        R"({"burstFovDelayMs":"1700"})",
-        R"({"burstFovDelayMs":1700.5})",
+        R"({"burstFovDelayMs":"1600"})",
+        R"({"burstFovDelayMs":1600.5})",
         R"({"burstFovDelayMs":true})",
         R"({"fixBurstFov":"true"})",
         R"({"fixBurstFov":1})",
@@ -60,7 +60,7 @@ int main() try {
     Read(c, R"({"fixBurstFov":true,"burstFovDelayMs":10000})");
     Check(c.fixBurstFov && c.burstFovDelayMs==10000, "maximum delay accepted");
     Read(c, R"({"targetFov":75})");
-    Check(!c.fixBurstFov && c.burstFovDelayMs==1700 && c.targetFov==75,
+    Check(!c.fixBurstFov && c.burstFovDelayMs==1600 && c.targetFov==75,
           "removed new fields reset to defaults on reload");
     std::cout << checks << " config checks passed against actual Config.cpp and pinned Glaze.\n";
     return 0;

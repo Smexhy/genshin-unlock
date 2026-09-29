@@ -42,8 +42,8 @@ bool isPreviousFov = false;
 // Return when the partner reappears or the configured delay expires.
 using BurstClock = std::chrono::steady_clock;
 bool fixBurstFov = false;
-std::chrono::milliseconds burstNativeLimit { 1700 };
-std::chrono::milliseconds activeBurstNativeLimit { 1700 };
+std::chrono::milliseconds burstNativeLimit { 1600 };
+std::chrono::milliseconds activeBurstNativeLimit { 1600 };
 constexpr float BURST_RETURN_SECONDS = 0.200f;
 constexpr unsigned int ALTERNATIONS_TO_ARM = 8;
 

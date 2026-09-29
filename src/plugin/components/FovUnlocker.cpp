@@ -1,15 +1,11 @@
 #include "plugin/components/FovUnlocker.hpp"
 #include "plugin/Helper.hpp"
 #include "util/ExponentialFilter.hpp"
-#include "util/win/Loader.hpp"
 
 #include <wil/result.h>
 
-#include <algorithm>
 #include <bit>
-#include <chrono>
 #include <cmath>
-#include <cstdio>
 #include <cstdint>
 #include <mutex>
 #include <intrin.h>
@@ -38,83 +34,39 @@ void* previousInstance = nullptr;
 float previousFov = 45.0f;
 bool isPreviousFov = false;
 
-using Clock = std::chrono::steady_clock;
-constexpr auto BURST_FOV_BYPASS_DURATION = std::chrono::milliseconds { 2750 };
-constexpr auto TRACE_DURATION = std::chrono::seconds { 5 };
-bool wasBurstKeyDown = false;
-bool isBurstFovBypass = false;
-bool isTracing = false;
-Clock::time_point burstFovBypassUntil {};
-Clock::time_point traceStart {};
-Clock::time_point traceUntil {};
+// Burst/cinematic detector.
+//
+// In normal gameplay, the FOV setter is called from two call sites that
+// alternate every frame (A, B, A, B...). During the affected burst
+// cinematic, the secondary call disappears and the remaining call site
+// repeats (A, A, A...). When B returns, normal gameplay has resumed.
+//
+// Learn the pattern dynamically instead of hard-coding caller addresses so
+// the detector is not tied to the RVAs observed in a single game build.
 uintptr_t gameModuleBase = 0;
-HANDLE traceFile = INVALID_HANDLE_VALUE;
+uintptr_t lastCallerRva = 0;
+uintptr_t burstCallerRva = 0;
+unsigned int alternatingTransitions = 0;
+bool detectorArmed = false;
+bool isBurstFovBypass = false;
 
-void WriteTraceHeader() noexcept {
-    if (traceFile == INVALID_HANDLE_VALUE) {
-        return;
-    }
-    static constexpr char header[] =
-        "us,thread,caller_rva,instance,input_fov,output_fov,mode\r\n";
-    DWORD written = 0;
-    ::WriteFile(
-        traceFile,
-        header,
-        static_cast<DWORD>(sizeof(header) - 1),
-        &written,
-        nullptr
-    );
+constexpr unsigned int ALTERNATIONS_TO_ARM = 8;
+
+uintptr_t GetCallerRva(void* returnAddress) noexcept {
+    const auto caller = reinterpret_cast<uintptr_t>(returnAddress);
+    return (caller >= gameModuleBase) ? (caller - gameModuleBase) : caller;
 }
 
-void TraceFov(
-    void* instance,
-    const float inputFov,
-    const float outputFov,
-    const char* mode,
-    void* returnAddress
-) noexcept {
-    if (!isTracing || traceFile == INVALID_HANDLE_VALUE) {
-        return;
-    }
+void ResetFovStateForGameplay(void* instance, float gameFov) noexcept {
+    previousInstance = instance;
+    previousFov = gameFov;
+    setFovCount = 0;
+    isPreviousFov = false;
 
-    const auto now = Clock::now();
-    if (now >= traceUntil) {
-        isTracing = false;
-        ::FlushFileBuffers(traceFile);
-        return;
-    }
-
-    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-        now - traceStart
-    ).count();
-    const auto caller = reinterpret_cast<uintptr_t>(returnAddress);
-    const auto callerRva =
-        (caller >= gameModuleBase) ? (caller - gameModuleBase) : caller;
-
-    char line[256] {};
-    const int length = std::snprintf(
-        line,
-        sizeof(line),
-        "%lld,%lu,0x%llX,0x%llX,%.9g,%.9g,%s\r\n",
-        static_cast<long long>(us),
-        static_cast<unsigned long>(GetCurrentThreadId()),
-        static_cast<unsigned long long>(callerRva),
-        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(instance)),
-        static_cast<double>(inputFov),
-        static_cast<double>(outputFov),
-        mode
-    );
-    if (length <= 0) {
-        return;
-    }
-
-    DWORD written = 0;
-    ::WriteFile(
-        traceFile,
-        line,
-        static_cast<DWORD>((std::min)(length, static_cast<int>(sizeof(line) - 1))),
-        &written,
-        nullptr
+    // The cinematic is already over here. Resume the configured gameplay FOV
+    // immediately instead of spending another second smoothing from 45.
+    filter.SetInitialValue(
+        (isHooked && isEnabled) ? static_cast<float>(targetFov) : gameFov
     );
 }
 } // namespace
@@ -125,11 +77,6 @@ FovUnlocker::FovUnlocker() noexcept = default;
 FovUnlocker::~FovUnlocker() noexcept {
     std::lock_guard lock { mutex };
     hook = {};
-    if (traceFile != INVALID_HANDLE_VALUE) {
-        ::FlushFileBuffers(traceFile);
-        ::CloseHandle(traceFile);
-        traceFile = INVALID_HANDLE_VALUE;
-    }
 }
 
 void FovUnlocker::Start() {
@@ -141,65 +88,19 @@ void FovUnlocker::Start() {
         default: THROW_WIN32(ERROR_NOT_SUPPORTED);
         }
     }();
-    gameModuleBase = reinterpret_cast<uintptr_t>(module);
-    const auto target = reinterpret_cast<void*>(
-        gameModuleBase + offset
-    );
-    const auto detour = reinterpret_cast<void*>(
-        HkSetFieldOfView
-    );
 
-    const auto tracePath =
-        z3lx::util::GetCurrentModuleFilePath().parent_path() /
-        "fov_trace.csv";
+    gameModuleBase = reinterpret_cast<uintptr_t>(module);
+    const auto target = reinterpret_cast<void*>(gameModuleBase + offset);
+    const auto detour = reinterpret_cast<void*>(HkSetFieldOfView);
 
     std::lock_guard lock { mutex };
     hook = mmh::Hook<void, void*, float>::Create(target, detour);
-    traceFile = ::CreateFileW(
-        tracePath.c_str(),
-        GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        nullptr,
-        CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL,
-        nullptr
-    );
-    WriteTraceHeader();
 }
 
 void FovUnlocker::Update() {
     const auto& cursor = GetComponent<CursorState>();
     const auto& window = GetComponent<WindowState>();
-    const bool shouldHook = window.IsFocused() && !cursor.IsVisible();
-    Hook(shouldHook);
-
-    // Diagnostic workaround for issue #75: temporarily let the game own FOV
-    // while a burst cinematic is expected to be active.
-    const bool burstKeyDown =
-        shouldHook && ((GetAsyncKeyState('Q') & 0x8000) != 0);
-
-    std::lock_guard lock { mutex };
-    if (burstKeyDown && !wasBurstKeyDown && isEnabled) {
-        const auto now = Clock::now();
-        isBurstFovBypass = true;
-        burstFovBypassUntil = now + BURST_FOV_BYPASS_DURATION;
-        isTracing = true;
-        traceStart = now;
-        traceUntil = now + TRACE_DURATION;
-
-        if (traceFile != INVALID_HANDLE_VALUE) {
-            static constexpr char marker[] = "0,0,0x0,0x0,0,0,Q_PRESSED\r\n";
-            DWORD written = 0;
-            ::WriteFile(
-                traceFile,
-                marker,
-                static_cast<DWORD>(sizeof(marker) - 1),
-                &written,
-                nullptr
-            );
-        }
-    }
-    wasBurstKeyDown = burstKeyDown;
+    Hook(window.IsFocused() && !cursor.IsVisible());
 }
 
 bool FovUnlocker::IsHooked() const noexcept {
@@ -247,27 +148,50 @@ void FovUnlocker::SetSmoothing(const float smoothing) noexcept {
 
 namespace {
 void HkSetFieldOfView(void* instance, float value) noexcept try {
-    const float inputValue = value;
     void* const returnAddress = _ReturnAddress();
+    const uintptr_t callerRva = GetCallerRva(returnAddress);
 
     std::lock_guard lock { mutex };
     if (!hook.IsCreated()) {
         return;
     }
 
+    // If we are already inside a detected cinematic, leave its FOV untouched.
+    // The first different caller marks the return of the normal A/B sequence.
     if (isBurstFovBypass) {
-        if (Clock::now() < burstFovBypassUntil) {
-            TraceFov(instance, inputValue, value, "BYPASS", returnAddress);
+        if (callerRva == burstCallerRva) {
             hook.CallOriginal(instance, value);
             return;
         }
 
         isBurstFovBypass = false;
-        previousInstance = instance;
-        previousFov = value;
-        setFovCount = 0;
-        isPreviousFov = false;
-        filter.SetInitialValue(value);
+        burstCallerRva = 0;
+        alternatingTransitions = 1;
+        lastCallerRva = callerRva;
+        ResetFovStateForGameplay(instance, value);
+    } else if (lastCallerRva == 0) {
+        lastCallerRva = callerRva;
+    } else if (callerRva != lastCallerRva) {
+        lastCallerRva = callerRva;
+        if (alternatingTransitions < ALTERNATIONS_TO_ARM) {
+            ++alternatingTransitions;
+        }
+        if (alternatingTransitions >= ALTERNATIONS_TO_ARM) {
+            detectorArmed = true;
+        }
+    } else {
+        // Two consecutive calls from the same site means the normal A/B
+        // alternation has broken. In the captured Vesna trace this occurs
+        // only during the burst cinematic.
+        if (detectorArmed && isHooked && isEnabled) {
+            isBurstFovBypass = true;
+            burstCallerRva = callerRva;
+            alternatingTransitions = 0;
+            hook.CallOriginal(instance, value);
+            return;
+        }
+
+        alternatingTransitions = 0;
     }
 
     ++setFovCount;
@@ -306,7 +230,6 @@ void HkSetFieldOfView(void* instance, float value) noexcept try {
         previousFov = value;
     }
 
-    TraceFov(instance, inputValue, value, "NORMAL", returnAddress);
     hook.CallOriginal(instance, value);
 } catch (...) {
     // Should never happen
